@@ -22,8 +22,10 @@ from storage import (
     save_user,
     update_user_location,
     update_user_notifications,
+    update_user_primary_city,
     has_location,
-    get_subscribed_users
+    get_subscribed_users,
+    migrate_user_data
 )
 
 load_dotenv()
@@ -33,6 +35,9 @@ if not BOT_TOKEN:
     raise ValueError("Не установлен BOT_TOKEN")
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# Выполняем миграцию данных пользователей при запуске
+migrate_user_data()
 
 # ============== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==============
 
@@ -68,7 +73,7 @@ def format_basic_weather(weather: dict) -> str:
     wind_dir = get_wind_direction(weather['wind'].get('deg', 0))
     
     text = f"""
-{emoji} <b>Погода в {weather['name']}</b>
+{emoji} <b>Погода в г. {weather['name']}</b>
 
 🌡️ <b>Температура:</b> {weather['main']['temp']:.1f}°C
 🤔 <b>Ощущается как:</b> {weather['main']['feels_like']:.1f}°C
@@ -195,14 +200,19 @@ def format_comparison(weather1: dict, weather2: dict) -> str:
 
 # ============== ПРОГНОЗ НА 5 ДНЕЙ ==============
 
+def get_russian_weekday_abbr(dt: datetime) -> str:
+    """Возвращает сокращенное русское название дня недели"""
+    weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+    return weekdays[dt.weekday()]
+
 def get_forecast_days(forecast_data: dict) -> dict:
     """Группирует прогноз по дням"""
     days = {}
     for item in forecast_data['list']:
         dt = datetime.fromtimestamp(item['dt'])
         day_key = dt.strftime('%Y-%m-%d')
-        day_name = dt.strftime('%d.%m (%a)')
-        
+        day_name = f"{dt.strftime('%d.%m')} ({get_russian_weekday_abbr(dt)})"
+
         if day_key not in days:
             days[day_key] = {
                 'name': day_name,
@@ -289,6 +299,9 @@ def get_main_keyboard() -> types.ReplyKeyboardMarkup:
         types.KeyboardButton("📊 Расширенные данные"),
         types.KeyboardButton("🔔 Уведомления")
     )
+    keyboard.add(
+        types.KeyboardButton("🏙️ Сменить основной город")
+    )
     return keyboard
 
 # ============== ОБРАБОТЧИКИ КОМАНД ==============
@@ -333,15 +346,24 @@ forecast_cache = {}  # Кэш прогнозов для callback обработ�
 @bot.message_handler(func=lambda m: m.text == "🌤️ Текущая погода")
 def request_current_weather(message):
     """Запрашивает выбор способа получения погоды"""
+    user_data = load_user(message.from_user.id)
+    primary_city = user_data.get('primary_city')
+
+    if primary_city:
+        # Есть основной город - показываем погоду сразу
+        show_city_weather(message.chat.id, primary_city)
+        return
+
+    # Нет основного города - показываем меню выбора
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton("🏙️ По городу", callback_data=f"current_city_{message.from_user.id}"),
         types.InlineKeyboardButton("📍 По геолокации", callback_data=f"current_location_{message.from_user.id}")
     )
-    
+
     bot.send_message(
         message.chat.id,
-        "🌤️ <b>Текущая погода</b>\n\nВыберите способ:",
+        "🌤️ <b>Текущая погода</b>\n\nУ вас не установлен основной город.\nВыберите способ:",
         parse_mode='HTML',
         reply_markup=keyboard
     )
@@ -439,8 +461,20 @@ def show_city_weather(chat_id: int, city: str):
 def request_forecast(message):
     """Запрашивает прогноз на 5 дней"""
     user_data = load_user(message.from_user.id)
-    
-    if user_data.get('lat') and user_data.get('lon'):
+    primary_city = user_data.get('primary_city')
+
+    # Приоритет: основной город > сохраненная геолокация > запрос ввода
+    if primary_city:
+        # Получаем координаты основного города
+        coords = get_coordinates(primary_city)
+        if coords:
+            show_forecast(message.chat.id, message.from_user.id,
+                         coords[0], coords[1], primary_city)
+        else:
+            bot.send_message(message.chat.id,
+                           f"❌ Не удалось найти координаты города '{primary_city}'.",
+                           reply_markup=get_main_keyboard())
+    elif user_data.get('lat') and user_data.get('lon'):
         city_name = user_data.get('city', 'Сохранённая локация')
         show_forecast(message.chat.id, message.from_user.id,
                      user_data['lat'], user_data['lon'], city_name)
@@ -448,7 +482,7 @@ def request_forecast(message):
         user_states[message.from_user.id] = "waiting_forecast_city"
         bot.send_message(
             message.chat.id,
-            "📍 У вас нет сохранённой локации.\n\n"
+            "📍 У вас нет сохранённой локации и основного города.\n\n"
             "Отправьте геолокацию или введите название города:",
             reply_markup=types.ReplyKeyboardRemove()
         )
@@ -636,15 +670,24 @@ def show_comparison(chat_id: int, city1: str, city2: str):
 @bot.message_handler(func=lambda m: m.text == "📊 Расширенные данные")
 def request_extended(message):
     """Запрашивает выбор способа получения расширенных данных"""
+    user_data = load_user(message.from_user.id)
+    primary_city = user_data.get('primary_city')
+
+    if primary_city:
+        # Есть основной город - показываем расширенные данные сразу
+        show_extended(message.chat.id, city=primary_city)
+        return
+
+    # Нет основного города - показываем меню выбора
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton("🏙️ По городу", callback_data=f"extended_city_{message.from_user.id}"),
         types.InlineKeyboardButton("📍 По геолокации", callback_data=f"extended_location_{message.from_user.id}")
     )
-    
+
     bot.send_message(
         message.chat.id,
-        "📊 <b>Расширенные данные</b>\n\nВыберите способ:",
+        "📊 <b>Расширенные данные</b>\n\nУ вас не установлен основной город.\nВыберите способ:",
         parse_mode='HTML',
         reply_markup=keyboard
     )
@@ -730,13 +773,97 @@ def show_extended(chat_id: int, city: str = None, lat: float = None, lon: float 
 
 # ============== УВЕДОМЛЕНИЯ ==============
 
+@bot.message_handler(func=lambda m: m.text == "🏙️ Сменить основной город")
+def change_primary_city(message):
+    """Обработчик смены основного города"""
+    user_data = load_user(message.from_user.id)
+    current_primary = user_data.get('primary_city', 'Не установлен')
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "🏙️ Ввести новый город",
+        callback_data=f"enter_primary_city_{message.from_user.id}"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "❌ Очистить основной город",
+        callback_data=f"clear_primary_city_{message.from_user.id}"
+    ))
+
+    text = f"""
+<b>🏙️ Настройка основного города</b>
+
+<b>Текущий основной город:</b> {current_primary}
+
+Основной город используется для быстрого получения погоды при нажатии на:
+• 🌤️ Текущая погода
+• 📅 Прогноз на 5 дней
+• 📊 Расширенные данные
+
+Выберите действие:
+"""
+    bot.send_message(message.chat.id, text, parse_mode='HTML',
+                    reply_markup=keyboard)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("enter_primary_city_"))
+def handle_enter_primary_city(call):
+    """Обработчик ввода нового основного города"""
+    user_id = int(call.data.split("_")[3])
+    user_states[user_id] = "waiting_primary_city"
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "🏙️ Введите название нового основного города:",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("clear_primary_city_"))
+def handle_clear_primary_city(call):
+    """Обработчик очистки основного города"""
+    user_id = int(call.data.split("_")[3])
+    update_user_primary_city(user_id, None)
+
+    bot.answer_callback_query(call.id, "✅ Основной город очищен")
+
+    # Обновляем сообщение
+    user_data = load_user(user_id)
+    current_primary = user_data.get('primary_city', 'Не установлен')
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "🏙️ Ввести новый город",
+        callback_data=f"enter_primary_city_{user_id}"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "❌ Очистить основной город",
+        callback_data=f"clear_primary_city_{user_id}"
+    ))
+
+    text = f"""
+<b>🏙️ Настройка основного города</b>
+
+<b>Текущий основной город:</b> {current_primary}
+
+Основной город используется для быстрого получения погоды при нажатии на:
+• 🌤️ Текущая погода
+• 📅 Прогноз на 5 дней
+• 📊 Расширенные данные
+
+Выберите действие:
+"""
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                         parse_mode='HTML', reply_markup=keyboard)
+
+
 @bot.message_handler(func=lambda m: m.text == "🔔 Уведомления")
 def show_notifications_menu(message):
     """Показывает меню уведомлений"""
     user_data = load_user(message.from_user.id)
     notifications = user_data.get('notifications', {})
     status = "✅ Включены" if notifications.get('enabled', False) else "❌ Выключены"
-    
+
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     if notifications.get('enabled', False):
         keyboard.add(types.InlineKeyboardButton(
@@ -744,17 +871,24 @@ def show_notifications_menu(message):
     else:
         keyboard.add(types.InlineKeyboardButton(
             "🔔 Включить", callback_data="subscribe"))
-    
+
+    keyboard.add(types.InlineKeyboardButton(
+        "🕐 Настроить период", callback_data=f"set_notification_time_{message.from_user.id}"))
+
     city = user_data.get('city', 'Не указана')
     location_status = f"📍 {city}" if user_data.get('lat') else "📍 Не указана"
-    
+
+    start_hour = notifications.get('start_hour', 9)
+    end_hour = notifications.get('end_hour', 21)
+
     text = f"""
 <b>🔔 Погодные уведомления</b>
 
 <b>Статус:</b> {status}
 <b>Локация:</b> {location_status}
+<b>Период:</b> {start_hour:02d}:00 — {end_hour:02d}:00
 
-Уведомления проверяют погоду каждые 2 часа и сообщают о:
+Уведомления проверяют погоду каждые 2 часа в указанный период и сообщают о:
 • 🌧️ Приближающемся дожде или снеге
 • 🌡️ Резком изменении температуры
 • ⛈️ Грозах и опасных явлениях
@@ -798,7 +932,7 @@ def unsubscribe_command(message):
 def handle_subscription(call):
     """Обработчик кнопок подписки"""
     user_data = load_user(call.from_user.id)
-    
+
     if call.data == "subscribe":
         if not user_data.get('lat'):
             bot.answer_callback_query(
@@ -807,37 +941,259 @@ def handle_subscription(call):
                 show_alert=True
             )
             return
-        
+
         update_user_notifications(call.from_user.id, enabled=True)
         bot.answer_callback_query(call.id, "✅ Уведомления включены!")
-        
+
     else:  # unsubscribe
         update_user_notifications(call.from_user.id, enabled=False)
         bot.answer_callback_query(call.id, "🔕 Уведомления отключены!")
-    
+
     # Обновляем сообщение
     user_data = load_user(call.from_user.id)
     notifications = user_data.get('notifications', {})
     status = "✅ Включены" if notifications.get('enabled', False) else "❌ Выключены"
-    
-    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
     if notifications.get('enabled', False):
         keyboard.add(types.InlineKeyboardButton(
             "🔕 Отключить", callback_data="unsubscribe"))
     else:
         keyboard.add(types.InlineKeyboardButton(
             "🔔 Включить", callback_data="subscribe"))
-    
+
+    keyboard.add(types.InlineKeyboardButton(
+        "🕐 Настроить период", callback_data=f"set_notification_time_{call.from_user.id}"))
+
     city = user_data.get('city', 'Не указана')
     location_status = f"📍 {city}" if user_data.get('lat') else "📍 Не указана"
-    
+
+    start_hour = notifications.get('start_hour', 9)
+    end_hour = notifications.get('end_hour', 21)
+
     text = f"""
 <b>🔔 Погодные уведомления</b>
 
 <b>Статус:</b> {status}
 <b>Локация:</b> {location_status}
+<b>Период:</b> {start_hour:02d}:00 — {end_hour:02d}:00
 
-Уведомления проверяют погоду каждые 2 часа и сообщают о:
+Уведомления проверяют погоду каждые 2 часа в указанный период и сообщают о:
+• 🌧️ Приближающемся дожде или снеге
+• 🌡️ Резком изменении температуры
+• ⛈️ Грозах и опасных явлениях
+
+<i>Для работы уведомлений нужно отправить геолокацию.</i>
+"""
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                         parse_mode='HTML', reply_markup=keyboard)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_notification_time_"))
+def handle_set_notification_time(call):
+    """Обработчик настройки периода уведомлений"""
+    user_id = int(call.data.split("_")[3])
+    user_data = load_user(user_id)
+    notifications = user_data.get('notifications', {})
+
+    current_start = notifications.get('start_hour', 9)
+    current_end = notifications.get('end_hour', 21)
+
+    # Создаем клавиатуру для выбора времени начала
+    keyboard = types.InlineKeyboardMarkup(row_width=4)
+
+    # Ряд с часами для начала периода (6:00 - 23:00)
+    hours_row = []
+    for hour in range(6, 24):
+        emoji = "🟢" if hour == current_start else "⚪"
+        hours_row.append(types.InlineKeyboardButton(
+            f"{emoji} {hour:02d}:00",
+            callback_data=f"set_start_hour_{hour}_{user_id}"
+        ))
+        if len(hours_row) == 4:
+            keyboard.add(*hours_row)
+            hours_row = []
+
+    if hours_row:  # Добавляем оставшиеся кнопки
+        keyboard.add(*hours_row)
+
+    # Ряд для выбора конца периода
+    keyboard.add(types.InlineKeyboardButton(
+        f"🏁 Конец периода: {current_end:02d}:00",
+        callback_data=f"select_end_hour_{user_id}"
+    ))
+
+    # Кнопка сохранения
+    keyboard.add(types.InlineKeyboardButton(
+        "✅ Сохранить настройки",
+        callback_data=f"save_time_settings_{user_id}"
+    ))
+
+    # Кнопка назад
+    keyboard.add(types.InlineKeyboardButton(
+        "◀️ Назад к уведомлениям",
+        callback_data=f"back_to_notifications_{user_id}"
+    ))
+
+    text = f"""
+<b>🕐 Настройка периода уведомлений</b>
+
+<b>Текущий период:</b> {current_start:02d}:00 — {current_end:02d}:00
+
+Выберите время начала периода уведомлений:
+"""
+
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                         parse_mode='HTML', reply_markup=keyboard)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_start_hour_"))
+def handle_set_start_hour(call):
+    """Обработчик выбора времени начала периода"""
+    parts = call.data.split("_")
+    start_hour = int(parts[3])
+    user_id = int(parts[4])
+
+    user_data = load_user(user_id)
+    current_end = user_data.get('notifications', {}).get('end_hour', 21)
+
+    # Временно сохраняем выбранное время начала
+    user_states[user_id] = f"setting_start_hour_{start_hour}"
+
+    # Создаем клавиатуру для выбора времени конца
+    keyboard = types.InlineKeyboardMarkup(row_width=4)
+
+    # Ряд с часами для конца периода (start_hour+1 до 23:00)
+    hours_row = []
+    for hour in range(start_hour + 1, 24):
+        emoji = "🟢" if hour == current_end else "⚪"
+        hours_row.append(types.InlineKeyboardButton(
+            f"{emoji} {hour:02d}:00",
+            callback_data=f"set_end_hour_{hour}_{user_id}"
+        ))
+        if len(hours_row) == 4:
+            keyboard.add(*hours_row)
+            hours_row = []
+
+    if hours_row:  # Добавляем оставшиеся кнопки
+        keyboard.add(*hours_row)
+
+    # Кнопка назад
+    keyboard.add(types.InlineKeyboardButton(
+        "◀️ Назад к началу периода",
+        callback_data=f"set_notification_time_{user_id}"
+    ))
+
+    text = f"""
+<b>🕐 Выбор времени конца периода</b>
+
+<b>Начало периода:</b> {start_hour:02d}:00
+
+Выберите время конца периода уведомлений:
+"""
+
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                         parse_mode='HTML', reply_markup=keyboard)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_end_hour_"))
+def handle_set_end_hour(call):
+    """Обработчик выбора времени конца периода"""
+    parts = call.data.split("_")
+    end_hour = int(parts[3])
+    user_id = int(parts[4])
+
+    # Получаем время начала из состояния
+    state = user_states.get(user_id, "")
+    if state.startswith("setting_start_hour_"):
+        start_hour = int(state.split("_")[3])
+
+        # Сохраняем настройки
+        update_user_notifications(user_id, start_hour=start_hour, end_hour=end_hour)
+
+        # Очищаем состояние
+        user_states.pop(user_id, None)
+
+        bot.answer_callback_query(call.id, f"✅ Период установлен: {start_hour:02d}:00 — {end_hour:02d}:00")
+
+        # Возвращаемся к меню уведомлений
+        user_data = load_user(user_id)
+        notifications = user_data.get('notifications', {})
+        status = "✅ Включены" if notifications.get('enabled', False) else "❌ Выключены"
+
+        keyboard = types.InlineKeyboardMarkup(row_width=2)
+        if notifications.get('enabled', False):
+            keyboard.add(types.InlineKeyboardButton(
+                "🔕 Отключить", callback_data="unsubscribe"))
+        else:
+            keyboard.add(types.InlineKeyboardButton(
+                "🔔 Включить", callback_data="subscribe"))
+
+        keyboard.add(types.InlineKeyboardButton(
+            "🕐 Настроить период", callback_data=f"set_notification_time_{user_id}"))
+
+        city = user_data.get('city', 'Не указана')
+        location_status = f"📍 {city}" if user_data.get('lat') else "📍 Не указана"
+
+        start_hour = notifications.get('start_hour', 9)
+        end_hour = notifications.get('end_hour', 21)
+
+        text = f"""
+<b>🔔 Погодные уведомления</b>
+
+<b>Статус:</b> {status}
+<b>Локация:</b> {location_status}
+<b>Период:</b> {start_hour:02d}:00 — {end_hour:02d}:00
+
+Уведомления проверяют погоду каждые 2 часа в указанный период и сообщают о:
+• 🌧️ Приближающемся дожде или снеге
+• 🌡️ Резком изменении температуры
+• ⛈️ Грозах и опасных явлениях
+
+<i>Для работы уведомлений нужно отправить геолокацию.</i>
+"""
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                             parse_mode='HTML', reply_markup=keyboard)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("back_to_notifications_"))
+def handle_back_to_notifications(call):
+    """Обработчик возврата к меню уведомлений"""
+    user_id = int(call.data.split("_")[3])
+
+    # Очищаем состояние если оно было
+    user_states.pop(user_id, None)
+
+    # Показываем меню уведомлений
+    user_data = load_user(user_id)
+    notifications = user_data.get('notifications', {})
+    status = "✅ Включены" if notifications.get('enabled', False) else "❌ Выключены"
+
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    if notifications.get('enabled', False):
+        keyboard.add(types.InlineKeyboardButton(
+            "🔕 Отключить", callback_data="unsubscribe"))
+    else:
+        keyboard.add(types.InlineKeyboardButton(
+            "🔔 Включить", callback_data="subscribe"))
+
+    keyboard.add(types.InlineKeyboardButton(
+        "🕐 Настроить период", callback_data=f"set_notification_time_{user_id}"))
+
+    city = user_data.get('city', 'Не указана')
+    location_status = f"📍 {city}" if user_data.get('lat') else "📍 Не указана"
+
+    start_hour = notifications.get('start_hour', 9)
+    end_hour = notifications.get('end_hour', 21)
+
+    text = f"""
+<b>🔔 Погодные уведомления</b>
+
+<b>Статус:</b> {status}
+<b>Локация:</b> {location_status}
+<b>Период:</b> {start_hour:02d}:00 — {end_hour:02d}:00
+
+Уведомления проверяют погоду каждые 2 часа в указанный период и сообщают о:
 • 🌧️ Приближающемся дожде или снеге
 • 🌡️ Резком изменении температуры
 • ⛈️ Грозах и опасных явлениях
@@ -895,7 +1251,7 @@ def inline_query_handler(query):
         
         # Создаем результат
         message_text = f"""
-{emoji} <b>Погода в {weather['name']}</b>
+{emoji} <b>Погода в г. {weather['name']}</b>
 
 🌡️ Температура: {temp:.1f}°C (ощущ. {feels_like:.1f}°C)
 📝 {description.capitalize()}
@@ -988,7 +1344,26 @@ def handle_text(message):
     elif state == "waiting_extended_city":
         user_states.pop(user_id, None)
         show_extended(message.chat.id, city=message.text)
-    
+
+    elif state == "waiting_primary_city":
+        user_states.pop(user_id, None)
+        # Проверяем, что город существует
+        coords = get_coordinates(message.text)
+        if coords:
+            update_user_primary_city(user_id, message.text)
+            bot.send_message(
+                message.chat.id,
+                f"✅ Основной город установлен: <b>{message.text}</b>",
+                parse_mode='HTML',
+                reply_markup=get_main_keyboard()
+            )
+        else:
+            bot.send_message(
+                message.chat.id,
+                f"❌ Город '{message.text}' не найден. Проверьте название.",
+                reply_markup=get_main_keyboard()
+            )
+
     elif state == "waiting_extended_location":
         # Ожидаем геолокацию, не текст
         bot.send_message(
@@ -1012,9 +1387,26 @@ def check_weather_alerts():
     """Проверяет погоду для подписчиков и отправляет уведомления"""
     while True:
         try:
+            # Получаем текущий час
+            current_hour = datetime.now().hour
+
             subscribed_users = get_subscribed_users()
-            
+
             for user_id, user_data in subscribed_users.items():
+                # Проверяем, находится ли текущий час в разрешенном периоде
+                notifications = user_data.get('notifications', {})
+                start_hour = notifications.get('start_hour', 9)
+                end_hour = notifications.get('end_hour', 21)
+
+                # Если период охватывает полные сутки (например, 00:00 - 23:59)
+                if start_hour <= end_hour:
+                    in_allowed_period = start_hour <= current_hour < end_hour
+                else:
+                    # Если период переходит через полночь (например, 22:00 - 06:00)
+                    in_allowed_period = current_hour >= start_hour or current_hour < end_hour
+
+                if not in_allowed_period:
+                    continue
                 if not user_data.get('lat') or not user_data.get('lon'):
                     continue
                 
