@@ -1,0 +1,25 @@
+# Environment variables (credentials, API keys, proxy settings)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# User data
+users/
+*.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

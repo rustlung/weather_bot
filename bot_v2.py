@@ -34,6 +34,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Не установлен BOT_TOKEN")
 
+# Настраиваем прокси для Telegram (requests к api.telegram.org)
+proxy_url = os.getenv("HTTPS_PROXY")
+if proxy_url:
+    telebot.apihelper.proxy = {"https": proxy_url}
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Выполняем миграцию данных пользователей при запуске
